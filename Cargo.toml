@@ -1,4 +1,6 @@
 [workspace]
+package.name = "sable"
+package.version = "0.0.1"
 members = [
     "sable_macros",
     "sable_network",
