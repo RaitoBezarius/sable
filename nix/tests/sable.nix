@@ -3,12 +3,24 @@
 let
   inherit (pkgs) lib system;
 
-  deriveFingerprint = certFile: builtins.readFile (pkgs.runCommand "openssl-get-sha1-fp" ''
-    ${lib.getExe pkgs.openssl} x509 -in ${certFile} -fingerprint -noout | sed 's/.*=//;s/://g;s/.*/Ł&/' > $out
-  '');
+  deriveFingerprint = certFile: lib.removeSuffix "\n" (builtins.readFile (pkgs.runCommandLocal "openssl-get-sha1-fp" {} ''
+    ${lib.getExe pkgs.openssl} x509 -in ${certFile} -outform DER | ${pkgs.coreutils}/bin/sha1sum | cut -d' ' -f1 > $out
+  ''));
+
+  wildcardTestCerts = rec {
+    caCert = ./ca/minica.pem;
+    caKey = ./ca/minica-key.pem;
+    caFingerprint = deriveFingerprint caCert;
+    nodeCert = ./ca/_.sable-server.test/cert.pem;
+    nodeKey = ./ca/_.sable-server.test/key.pem;
+    nodeFingerprint = deriveFingerprint nodeCert;
+    mgmtCert = ./ca/mgmt.test/cert.pem;
+    mgmtKey = ./ca/mgmt.test/cert.key;
+    mgmtFingerprint = deriveFingerprint mgmtCert;
+  };
   nodeConfig = { serverId, serverName, managementHostPort ? 8080, serverIP, caFile, managementClientCaFile, keyFile, certFile
-    , bootstrapped ? false, peers ? null }: { ... }:
-    let myFingerprint = ""; # deriveFingerprint certFile; # compute it
+    , bootstrapped ? false, peers ? null, authorisedUsersForManagement ? [] }: { ... }:
+    let myFingerprint = deriveFingerprint certFile;
     in {
       imports = [ 
         sableModule
@@ -55,10 +67,7 @@ let
           management = {
             address = "127.0.0.1:8888";
             client_ca = managementClientCaFile;
-            authorised_fingerprints = [{
-              name = "user1";
-              fingerprint = "435bc6db9f22e84ba5d9652432154617c9509370";
-            }];
+            authorised_fingerprints = authorisedUsersForManagement;
           };
 
           server.listeners = [
@@ -108,6 +117,10 @@ let
             managementClientCaFile = ../../configs/ca_cert.pem;
             keyFile = ../../configs/server1.key;
             certFile = ../../configs/server1.pem;
+            authorisedUsersForManagement = [{
+              name = "user1";
+              fingerprint = "435bc6db9f22e84ba5d9652432154617c9509370";
+            }];
           })
           machine
         ];
@@ -144,45 +157,45 @@ in {
 
   basicMultiNodes = 
   let
-    peers = [
-      {
-        name = "server1.test";
-        address = "192.168.1.10:6668";
-        fingerprint = "961090b178e037be12a77c0a83876740e3222abd";
-      }
-      {
-        name = "server2.test";
-        address = "192.168.1.11:6668";
-        fingerprint = "000fd90df3da5619563eb49228229ac410acc09c";
-      }
-    ];
-    servers = {
-      server1 = nodeConfig {
-        serverId = 1;
-        serverName = "server1.test";
-        bootstrapped = true;
-        serverIP = "192.168.1.10";
-        caFile = ../../configs/ca_cert.pem;
-        managementClientCaFile = ../../configs/ca_cert.pem;
-        keyFile = ../../configs/server1.key;
-        certFile = ../../configs/server1.pem;
-        managementHostPort = 8080;
-        inherit peers;
-      };
-      server2 = nodeConfig {
-        serverId = 2;
-        serverName = "server2.test";
-        bootstrapped = false;
-        serverIP = "192.168.1.11";
-        caFile = ../../configs/ca_cert.pem;
-        managementClientCaFile = ../../configs/ca_cert.pem;
-        keyFile = ../../configs/server2.key;
-        certFile = ../../configs/server2.pem;
-        managementHostPort = 8081;
-        inherit peers;
-      };
+    # 192.168.1.1 is client.
+    ipAddressFromId = id: "192.168.1.${toString (id + 1)}";
+    mkPeer = id: {
+      name = "${toString id}.sable-network.test";
+      address = "${ipAddressFromId id}:6668";
+      fingerprint = wildcardTestCerts.nodeFingerprint;
     };
-    serverNames = [ "server1" "server2" ];
+    mkPeers = nbServers:
+      map mkPeer (lib.range 1 nbServers);
+    mkNode = peers: id: nodeConfig {
+      serverId = id;
+      serverName = "${toString id}.sable-network.test";
+      serverIP = ipAddressFromId id;
+
+      # server1 is bootstrapped.
+      bootstrapped = if id == 1 then true else false;
+
+      caFile = wildcardTestCerts.caCert;
+
+      managementClientCaFile = wildcardTestCerts.caCert;
+      managementHostPort = 8080 + id;
+      authorisedUsersForManagement = [{
+        name = "test";
+        fingerprint = wildcardTestCerts.mgmtFingerprint;
+      }];
+
+      certFile = wildcardTestCerts.nodeCert;
+      keyFile = wildcardTestCerts.nodeKey;
+
+      inherit peers;
+    };
+
+    nbServers = 5;
+    peers = mkPeers nbServers;
+    mkNetworkNode = mkNode peers;
+
+    servers = lib.listToAttrs
+      (map (index: lib.nameValuePair "server${toString index}" (mkNetworkNode index)) (lib.range 1 nbServers));
+    serverNames = builtins.attrNames servers;
   in
   mkMultiNodeTest {
     name = "basic-multinodes-sable";
@@ -207,23 +220,22 @@ in {
 
       def get_network_state(server):
         # For now, certificate expired, so -k is necessary.
-        intermediate = json.loads(server.succeed("curl -k --capath ${../../configs/ca_cert.pem} --cert ${../../configs/mgmt.pem} --key ${../../configs/mgmt.key} https://localhost:8888/dump-network"))
+        intermediate = json.loads(server.succeed("curl -k --capath ${wildcardTestCerts.caCert} --cert ${wildcardTestCerts.mgmtCert} --key ${wildcardTestCerts.mgmtKey} https://localhost:8888/dump-network"))
         # Fix up 'servers' which are HashMap<Id, Type>
         intermediate['servers'] = {k: v for (k, v) in intermediate['servers']}
         return intermediate
 
-      # This server has a mgmt endpoint because it's bootstrapped
-      # The other not yet until sync.
-      test_server("server-a", "server1", "test-from-a")
-      # Wait for synchronization.
-      server2.wait_for_open_port(8888)
-      test_server("server-b", "server1", "test-from-b")
-      nstate_a = get_network_state(server1)
-      nstate_b = get_network_state(server2)
-      print(nstate_a)
-      print(nstate_b)
+      for server in servers:
+        server.wait_for_open_port(8888)
 
-      assert nstate_a == nstate_b, "Network state diverged"
+      states = []
+      for server in servers:
+        states.append(get_network_state(server))
+
+      for idx, (state_a, state_b) in enumerate(zip(states, states[1:])):
+        assert state_a == state_b, f"Network state between server {idx} and {idx + 1} has diverged"
+
+      print(states[-1])
     '';
   };
 }
